@@ -1,0 +1,10 @@
+{
+  "name": "detector-marca-dagua",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=20" },
+  "dependencies": { "ffmpeg-static": "^5.2.0" }
+}
