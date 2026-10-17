@@ -5,13 +5,16 @@
  *   GET /health                                   -> { ok: true }   (use para acordar o serviço)
  *   GET /analisar?u=<link do vídeo>[&min=<duração em minutos>]
  *       cabeçalho  X-Segredo: <MARCA_SEGREDO>     (ou ?k=<MARCA_SEGREDO>)
+ *   GET /info?u=<link do vídeo>   (mesmo segredo) -> o ffmpeg lê o arquivo:
+ *       { ok, duracaoMin, bitrateKbps, video: { codec, largura, altura }, audio: [{ idioma, codec }], legendas, decodifica, cache, ms }
+ *       ok:false = o ffmpeg não conseguiu abrir (link bloqueado, formato estranho). "decodifica" é informativo (1 quadro no meio do vídeo).
  *   resposta 200: { status: 'marca' | 'limpo' | 'indeterminado', regiao?, score?, texto?, cache: bool, ms }
  *       'marca' = suspeita forte de marca fixa (logo/texto) | 'limpo' = não achou | 'indeterminado' = não deu para analisar
  *   outros: 401 sem/errado segredo | 400 link inválido | 403 endereço interno bloqueado | 429 ocupado (tente depois)
  *
  * Variáveis (Render > Environment):
  *   MARCA_SEGREDO (obrigatória)   MARCA_LIMITE (padrão 0.035)   MARCA_QUADRO_MS (padrão 20000)
- *   MAX_PARALELO (padrão 2: análises ao mesmo tempo)   PERMITIR_LOCAL=1 (só para testes: libera 127.0.0.1)
+ *   MAX_PARALELO (padrão 2: análises ao mesmo tempo)   FFMPEG_PATH (opcional: usa este ffmpeg em vez do embutido)   PERMITIR_LOCAL=1 (só para testes)
  *
  * É uma SUSPEITA por imagem, não uma prova: logo de canal e legenda fixa em todos os quadros também podem ser marcados.
  */
@@ -29,8 +32,8 @@ const MAX_PARALELO = Math.max(1, Math.min(6, Number(process.env.MAX_PARALELO) ||
 const FILA_MAX = 8;
 const TTL = 24 * 3600 * 1000;
 
-let FFMPEG = 'ffmpeg';
-try { const m = await import('ffmpeg-static'); if (m && m.default) FFMPEG = m.default; } catch { /* usa o ffmpeg do sistema, se houver */ }
+let FFMPEG = String(process.env.FFMPEG_PATH || '').trim() || 'ffmpeg';
+if (!process.env.FFMPEG_PATH) { try { const m = await import('ffmpeg-static'); if (m && m.default) FFMPEG = m.default; } catch { /* usa o ffmpeg do sistema, se houver */ } }
 let ffmpegPronto;
 function ffmpegOk() {
   if (!ffmpegPronto) {
@@ -127,21 +130,61 @@ function analisarQuadros(quadros, w, h, limite) {
 }
 
 
-// ---------- duração (quando o chamador não informa) ----------
-function duracaoMin(u) {
+// ---------- leitura do arquivo pelo ffmpeg (duração, codec, bitrate, idiomas) ----------
+// Roda "ffmpeg -i <link>" só para ler o cabeçalho (sai sozinho com erro "sem saída", o que é normal) e devolve o texto do cabeçalho.
+function sondarTexto(u) {
   return new Promise((resolve) => {
     let p;
-    try { p = spawn(FFMPEG, ['-hide_banner', '-nostdin', '-user_agent', UA, '-i', u], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { return resolve(null); }
+    try { p = spawn(FFMPEG, ['-hide_banner', '-nostdin', '-user_agent', UA, '-probesize', '5000000', '-analyzeduration', '5000000', '-i', u], { stdio: ['ignore', 'ignore', 'pipe'] }); } catch { return resolve(''); }
     let err = '';
     const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch { /* já saiu */ } }, 15000);
-    p.stderr.on('data', (d) => { if (err.length < 20000) err += d; });
-    p.on('error', () => { clearTimeout(t); resolve(null); });
-    p.on('close', () => {
-      clearTimeout(t);
-      const m = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(err);
-      resolve(m ? (Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3])) / 60 : null);
-    });
+    p.stderr.on('data', (d) => { if (err.length < 40000) err += d; });
+    p.on('error', () => { clearTimeout(t); resolve(''); });
+    p.on('close', () => { clearTimeout(t); resolve(err); });
   });
+}
+function lerSonda(txt) {
+  const d = /Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)(?:,\s*start:\s*[\d.]+)?(?:,\s*bitrate:\s*(\d+)\s*kb\/s)?/.exec(txt);
+  if (!d) return null;
+  const out = { duracaoMin: (Number(d[1]) * 3600 + Number(d[2]) * 60 + Number(d[3])) / 60, bitrateKbps: d[4] ? Number(d[4]) : null, video: null, audio: [], legendas: 0 };
+  const re = /Stream #\d+:\d+(?:\((\w+)\))?[^:\n]*:\s*(Video|Audio|Subtitle):\s*([^,\n]+)([^\n]*)/g;
+  let m;
+  while ((m = re.exec(txt))) {
+    if (m[2] === 'Video' && !out.video) {
+      const wh = /\b(\d{3,5})x(\d{3,5})\b/.exec(m[4] || '');
+      out.video = { codec: m[3].trim().split(' ')[0], largura: wh ? Number(wh[1]) : null, altura: wh ? Number(wh[2]) : null };
+    } else if (m[2] === 'Audio') out.audio.push({ idioma: m[1] || null, codec: m[3].trim().split(' ')[0] });
+    else if (m[2] === 'Subtitle') out.legendas++;
+  }
+  return out;
+}
+async function duracaoMin(u) {
+  const s = lerSonda(await sondarTexto(u));
+  return s ? s.duracaoMin : null;
+}
+
+const cacheInfo = new Map(); // link -> { t, r }
+const infoEmAndamento = new Map();
+async function infoArquivo(u) {
+  const e = cacheInfo.get(u);
+  if (e && Date.now() - e.t < TTL) return Object.assign({}, e.r, { cache: true });
+  if (e) cacheInfo.delete(u);
+  if (infoEmAndamento.has(u)) return infoEmAndamento.get(u);
+  const tarefa = (async () => {
+    if (!(await entrar())) return { status: 'ocupado' };
+    try {
+      const s = lerSonda(await sondarTexto(u));
+      if (!s) return { ok: false, texto: 'o ffmpeg não conseguiu abrir o arquivo', cache: false };
+      // confere se dá para decodificar 1 quadro no meio do vídeo (informativo)
+      const q = await quadroCinza(u, Math.max(1, s.duracaoMin * 30), MARCA_QUADRO_MS);
+      const r = Object.assign({ ok: true }, s, { decodifica: !!q, cache: false });
+      if (cacheInfo.size >= 3000) cacheInfo.clear();
+      cacheInfo.set(u, { t: Date.now(), r });
+      return r;
+    } finally { sair(); }
+  })();
+  infoEmAndamento.set(u, tarefa);
+  try { return await tarefa; } finally { infoEmAndamento.delete(u); }
 }
 
 // ---------- segurança: não deixa usar o serviço para abrir endereços internos ----------
@@ -219,14 +262,19 @@ function iniciar() {
     try {
       const url = new URL(req.url, 'http://x');
       if (url.pathname === '/health') return json(res, 200, { ok: true, ffmpeg: await ffmpegOk(), rodando, fila: fila.length });
-      if (url.pathname !== '/analisar') return json(res, 404, { erro: 'não encontrado' });
+      if (url.pathname !== '/analisar' && url.pathname !== '/info') return json(res, 404, { erro: 'não encontrado' });
       const dado = String(req.headers['x-segredo'] || url.searchParams.get('k') || '');
       if (!SEGREDO || dado.length !== SEGREDO.length || !dado.split('').every((ch, i) => ch === SEGREDO[i])) return json(res, 401, { erro: 'segredo inválido' });
       const u = String(url.searchParams.get('u') || '');
       if (!/^https?:\/\//i.test(u) || u.length > 4000) return json(res, 400, { erro: 'link inválido' });
       if (!(await hostPermitido(u))) return json(res, 403, { erro: 'endereço não permitido' });
-      if (!(await ffmpegOk())) return json(res, 200, { status: 'indeterminado', texto: 'ffmpeg indisponível no servidor', cache: false });
+      if (!(await ffmpegOk())) return json(res, 200, url.pathname === '/info' ? { ok: false, texto: 'ffmpeg indisponível no servidor' } : { status: 'indeterminado', texto: 'ffmpeg indisponível no servidor', cache: false });
       const t0 = Date.now();
+      if (url.pathname === '/info') {
+        const inf = await infoArquivo(u);
+        if (inf.status === 'ocupado') return json(res, 429, { erro: 'ocupado, tente depois' });
+        return json(res, 200, Object.assign({}, inf, { ms: Date.now() - t0 }));
+      }
       const r = await analisar(u, url.searchParams.get('min'));
       if (r.status === 'ocupado') return json(res, 429, { erro: 'ocupado, tente depois' });
       return json(res, 200, Object.assign({}, r, { ms: Date.now() - t0 }));
@@ -243,5 +291,5 @@ function iniciar() {
   return servidor;
 }
 
-export { analisar, analisarQuadros, iniciar };
+export { analisar, analisarQuadros, infoArquivo, iniciar };
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) iniciar();
